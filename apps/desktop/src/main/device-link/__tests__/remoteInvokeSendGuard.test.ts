@@ -21,6 +21,7 @@ function loadRemoteInvoke(overrides: Record<string, unknown>) {
     assertNotStandby: () => {},
     assertRemoteControlTargetEnabled: () => {},
     openLinkCloseEpochs: new Map<string, number>(),
+    foregroundInvokesInFlight: new Map<string, number>(),
     ensureOnlineForRequest: async () => {},
     isScopedPeer: () => false,
     tryPeerInvoke: async () => null,
@@ -47,11 +48,31 @@ function loadBackgroundInvoke(overrides: Record<string, unknown>) {
     openRemoteLink: vi.fn(),
     assertBackgroundLinkAccepted: () => {},
     snapshotSubscriptions: () => [],
+    foregroundInvokesInFlight: new Map<string, number>(),
     closeRemoteLink: vi.fn(),
     ...overrides,
   };
   return new Function(...Object.keys(dependencies), backgroundCode + '; return remoteBackgroundInvoke;')(...Object.values(dependencies));
 }
+
+it('tracks a foreground invoke while it is pending without treating background reads as foreground', async () => {
+  const foregroundInvokesInFlight = new Map<string, number>();
+  let release!: () => void;
+  const pendingReply = new Promise<{ ok: true; result: null }>((resolve) => {
+    release = () => resolve({ ok: true, result: null });
+  });
+  const remoteInvoke = loadRemoteInvoke({
+    foregroundInvokesInFlight,
+    client: { invoke: vi.fn().mockReturnValueOnce(pendingReply).mockResolvedValue({ ok: true, result: null }) },
+  });
+  const foreground = remoteInvoke('host', 'remote-desktop', []);
+  expect(foregroundInvokesInFlight.get('host')).toBe(1);
+  release();
+  await foreground;
+  expect(foregroundInvokesInFlight.has('host')).toBe(false);
+  await remoteInvoke('host', 'provider-group:remote', [], { passiveLink: true });
+  expect(foregroundInvokesInFlight.has('host')).toBe(false);
+});
 
 it.each(['target resolution', 'link opening', 'online wait', 'reliable link recovery'])(
   'does not send an old account’s background request after account changes during %s', async (stage) => {
