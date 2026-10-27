@@ -3,7 +3,7 @@ import ts from 'typescript';
 import { expect, it, vi } from 'vitest';
 import { DeviceLinkError, FILE_PEER_CHANNEL, type DeviceLinkClient } from '@cindy/device-link';
 import { ensureInvokeLinkReady, invokeWithClosedLinkRecovery } from '../linkRecovery';
-import { assertSubscriptionLinkAccepted } from '../backgroundLink';
+import { assertBackgroundLinkAccepted, assertSubscriptionLinkAccepted, hasControlSubscription } from '../backgroundLink';
 
 // Run the production adapter with only its host dependencies injected, without
 // importing Electron startup. The shared-client tests cover actual queue admission.
@@ -14,6 +14,20 @@ const compiled = ts.transpileModule(declaration.getText(source).replace(/^export
   compilerOptions: { target: ts.ScriptTarget.ES2022 },
 }).outputText;
 
+function loadForegroundStateReader(
+  foregroundInvokesInFlight: Map<string, { epoch: number; count: number }>,
+  openLinkCloseEpochs: Map<string, number>,
+) {
+  const node = source.statements.find((statement): statement is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(statement) && statement.name?.text === 'hasForegroundInvokeInCurrentEpoch')!;
+  const code = ts.transpileModule(node.getText(source), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return new Function('foregroundInvokesInFlight', 'openLinkCloseEpochs', code + '; return hasForegroundInvokeInCurrentEpoch;')(
+    foregroundInvokesInFlight, openLinkCloseEpochs,
+  ) as (deviceId: string) => boolean;
+}
+
 type PeerInvoke = (peer: string, channel: string, args: unknown[]) => Promise<unknown>;
 
 function loadRemoteInvoke(overrides: Record<string, unknown>) {
@@ -22,7 +36,7 @@ function loadRemoteInvoke(overrides: Record<string, unknown>) {
     assertNotStandby: () => {},
     assertRemoteControlTargetEnabled: () => {},
     openLinkCloseEpochs: new Map<string, number>(),
-    foregroundInvokesInFlight: new Map<string, number>(),
+    foregroundInvokesInFlight: new Map<string, { epoch: number; count: number }>(),
     ensureOnlineForRequest: async () => {},
     isScopedPeer: () => false,
     tryPeerInvoke: async () => null,
@@ -50,7 +64,9 @@ function loadBackgroundInvoke(overrides: Record<string, unknown>) {
     assertBackgroundLinkAccepted: () => {},
     parseSharedTaskPeer: () => null,
     snapshotSubscriptions: () => [],
-    foregroundInvokesInFlight: new Map<string, number>(),
+    foregroundInvokesInFlight: new Map<string, { epoch: number; count: number }>(),
+    hasForegroundInvokeInCurrentEpoch: () => false,
+    hasControlSubscription,
     closeRemoteLink: vi.fn(),
     ...overrides,
   };
@@ -69,7 +85,8 @@ function loadRemoteSubscribe(overrides: Record<string, unknown>) {
     assertRemoteControlTargetEnabled: () => {},
     assertRemoteControlTargetEnabledAfterReopen: () => {},
     openLinkCloseEpochs: new Map<string, number>(),
-    foregroundInvokesInFlight: new Map<string, number>(),
+    foregroundInvokesInFlight: new Map<string, { epoch: number; count: number }>(),
+    hasForegroundInvokeInCurrentEpoch: () => false,
     ensureOnlineForRequest: async () => {},
     snapshotSubscriptions: () => [{ deviceId: 'host', topics: ['sessions'] }],
     requiresSessionLink: () => true,
@@ -138,7 +155,7 @@ it('allows a foreground subscription to join an in-flight legacy background open
 });
 
 it('tracks a foreground invoke while it is pending without treating background reads as foreground', async () => {
-  const foregroundInvokesInFlight = new Map<string, number>();
+  const foregroundInvokesInFlight = new Map<string, { epoch: number; count: number }>();
   let release!: () => void;
   const pendingReply = new Promise<{ ok: true; result: null }>((resolve) => {
     release = () => resolve({ ok: true, result: null });
@@ -148,12 +165,55 @@ it('tracks a foreground invoke while it is pending without treating background r
     client: { invoke: vi.fn().mockReturnValueOnce(pendingReply).mockResolvedValue({ ok: true, result: null }) },
   });
   const foreground = remoteInvoke('host', 'remote-desktop', []);
-  expect(foregroundInvokesInFlight.get('host')).toBe(1);
+  expect(foregroundInvokesInFlight.get('host')).toEqual({ epoch: 0, count: 1 });
   release();
   await foreground;
   expect(foregroundInvokesInFlight.has('host')).toBe(false);
   await remoteInvoke('host', 'provider-group:remote', [], { passiveLink: true });
   expect(foregroundInvokesInFlight.has('host')).toBe(false);
+});
+
+it('closes a new unsupported background link despite an old-epoch foreground reply still pending', async () => {
+  const foregroundInvokesInFlight = new Map<string, { epoch: number; count: number }>();
+  const openLinkCloseEpochs = new Map<string, number>();
+  const hasForegroundInvokeInCurrentEpoch = loadForegroundStateReader(foregroundInvokesInFlight, openLinkCloseEpochs);
+  let finishOld!: () => void;
+  let finishNew!: () => void;
+  const oldReply = new Promise<{ ok: true; result: null }>((resolve) => {
+    finishOld = () => resolve({ ok: true, result: null });
+  });
+  const newReply = new Promise<{ ok: true; result: null }>((resolve) => {
+    finishNew = () => resolve({ ok: true, result: null });
+  });
+  const invoke = vi.fn().mockReturnValueOnce(oldReply).mockReturnValueOnce(newReply);
+  const remoteInvoke = loadRemoteInvoke({
+    foregroundInvokesInFlight, openLinkCloseEpochs, client: { invoke },
+  });
+  const oldForeground = remoteInvoke('host', 'remote-desktop', []);
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(1));
+  expect(hasForegroundInvokeInCurrentEpoch('host')).toBe(true);
+
+  // Explicit link close moves to a new epoch while the old invoke awaits its reply.
+  openLinkCloseEpochs.set('host', 1);
+  expect(hasForegroundInvokeInCurrentEpoch('host')).toBe(false);
+  const closeRemoteLink = vi.fn(() => openLinkCloseEpochs.set('host', 2));
+  const backgroundInvoke = loadBackgroundInvoke({
+    client: { isLinkReady: () => false },
+    foregroundInvokesInFlight, openLinkCloseEpochs, hasForegroundInvokeInCurrentEpoch,
+    openRemoteLink: vi.fn().mockResolvedValue({ capabilities: [] }),
+    assertBackgroundLinkAccepted, closeRemoteLink,
+  });
+  await expect(backgroundInvoke('host', 'usage:read', [])).rejects.toThrow(/UNSUPPORTED_CAPABILITY/);
+  expect(closeRemoteLink).toHaveBeenCalledOnce();
+
+  const newForeground = remoteInvoke('host', 'remote-desktop', []);
+  await vi.waitFor(() => expect(invoke).toHaveBeenCalledTimes(2));
+  finishOld();
+  await oldForeground;
+  expect(hasForegroundInvokeInCurrentEpoch('host')).toBe(true);
+  finishNew();
+  await newForeground;
+  expect(hasForegroundInvokeInCurrentEpoch('host')).toBe(false);
 });
 
 it.each(['target resolution', 'link opening', 'online wait', 'reliable link recovery'])(
